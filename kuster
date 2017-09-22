@@ -1,0 +1,354 @@
+#!/usr/bin/python3
+
+import re
+import sys
+import yaml
+import argparse
+import argcomplete
+import subprocess
+
+
+def load_parser():
+    """
+    Create a parser and load it with CLI arguments
+
+    Returns: ArgumentParser instance
+    """
+    parser = argparse.ArgumentParser(prog='kuster')
+    subparsers = parser.add_subparsers(title='Available commands',
+                                       dest='kuster_command')
+
+    subparsers.add_parser(
+        'export-cluster',
+        help='Export cluster deployments, statefulsets, services and hpa ' +
+             'to the current dir as yamls')
+    subparsers.add_parser('resources', help='Get cluster resource utilization')
+    subparsers.add_parser('pods',
+                          help='Get pod distribution inside the cluster')
+    subparsers.add_parser('limits', help='Get limits of the resources')
+
+    argcomplete.autocomplete(parser)
+    return parser
+
+
+class Kluster():
+    def __init__(self):
+        self.get_namespaces()
+        self.get_servers()
+
+    def get_namespaces(self):
+        all_namespaces = subprocess.check_output(
+            "kubectl get namespaces", shell=True).decode().splitlines()[1:]
+        self.namespaces = [namespace.split()[0]
+                           for namespace in all_namespaces]
+
+    def get_servers(self):
+        all_nodes = yaml.safe_load(subprocess.check_output(
+            "kubectl get nodes -o yaml", shell=True).decode())['items']
+        self.masters = []
+        self.nodes = []
+        for node_yaml in all_nodes:
+            if 'kubernetes.io/role' in node_yaml['metadata']['labels'].keys() \
+                    and 'master' in \
+                    node_yaml['metadata']['labels']['kubernetes.io/role']:
+                self.masters.append(Server(node_yaml))
+            else:
+                self.nodes.append(Server(node_yaml))
+
+    def print_pod_number_in_cluster(self):
+
+        def print_pod_number_in_nodes(nodes):
+            for node in nodes:
+                print("### " + node.name)
+                for namespace in self.namespaces:
+                    print("* {0: <11} : {1:}".format(
+                             namespace, str(len(node.get_pods(namespace)))))
+                print("* Total       : {}".format(str(len(node.get_pods()))))
+
+        print('\n\n# Pods in the cluster')
+        print('## Masters')
+        print_pod_number_in_nodes(self.masters)
+        print('\n## Nodes')
+        print_pod_number_in_nodes(self.nodes)
+
+    def print_pods_in_cluster(self):
+
+        def print_pods_in_nodes(nodes):
+            for node in nodes:
+                print("\n### " + node.name)
+                for namespace in self.namespaces:
+                    print("* {0: <11}".format(namespace))
+                    for podname in node.get_pods(namespace):
+                        print("\t* {}".format(podname))
+
+        print('\n\n# Pods in the cluster')
+        print('## Masters')
+        print_pods_in_nodes(self.masters)
+        print('\n## Nodes')
+        print_pods_in_nodes(self.nodes)
+
+    def print_allocated_resources_in_cluster(self):
+        def print_allocated_resources_in_nodes(nodes):
+            for node in nodes:
+                print("\n### " + node.name)
+                print("* cpu:")
+                print("  * limits: {} ({})".format(
+                    node.allocated_resources['cpu_limits'],
+                    node.allocated_resources['cpu_limits_percent']))
+                print("  * requests: {} ({})".format(
+                    node.allocated_resources['cpu_requests'],
+                    node.allocated_resources['cpu_requests_percent']))
+                print("* memory:")
+                print("  * limits: {} ({})".format(
+                    node.allocated_resources['memory_limits'],
+                    node.allocated_resources['memory_limits_percent']))
+                print("  * requests: {} ({})".format(
+                    node.allocated_resources['memory_requests'],
+                    node.allocated_resources['memory_requests_percent']))
+        print('\n\n# Resource use in the cluster')
+        print('## Masters')
+        print_allocated_resources_in_nodes(self.masters)
+        print('\n## Nodes')
+        print_allocated_resources_in_nodes(self.nodes)
+
+
+class Server():
+    def __init__(self, yaml):
+        self.data = yaml
+        self.name = self.data['metadata']['name']
+        self.parse_info()
+
+    def parse_info(self):
+        raw_node_info = subprocess.check_output(
+            "kubectl describe node {}".format(self.name),
+            shell=True).decode().splitlines()
+
+        for line in raw_node_info:
+            if re.match('^(\w[\w -]?)*?:', line):
+                try:
+                    if key:
+                        setattr(self,
+                                key,
+                                NodeInfoParser(key, raw_key_data).value)
+                except NameError:
+                    pass
+                key = re.sub('-', '_', re.sub(' ', '_',
+                                              line.split(':')[0].lower()))
+                raw_key_data = [':'.join(line.split(':')[1:])]
+            else:
+                raw_key_data.append(line.rstrip())
+        setattr(self, key, NodeInfoParser(key, raw_key_data).value)
+
+    def get_pods(self, namespace=None):
+        try:
+            if namespace is None:
+                return [pod['name'] for pod in self.non_terminated_pods]
+            else:
+                return [pod['name']
+                        for pod in self.non_terminated_pods
+                        if pod['namespace'] == namespace]
+        except TypeError:
+            return []
+
+
+class NodeInfoParser():
+    def __init__(self, key, raw_key_data):
+        self.key = key
+        self.raw = raw_key_data
+        try:
+            parsing_method = getattr(self, self.key)
+            parsing_method()
+        except AttributeError:
+            self.default()
+
+    def default(self):
+        if len(self.raw) == 1:
+            self.value = str(self.raw[0]).strip()
+        else:
+            self.value = self.raw
+
+    def labels(self):
+        result = {}
+        for line in self.raw:
+            key = line.split('/')[0]
+            value = line.split('=')[1]
+            try:
+                subkey = line.split('/')[1]
+                result[key][subkey] = value
+            except KeyError:
+                result[key] = {}
+                result[key][subkey] = value
+            except IndexError:
+                result[key] = value
+        self.value = result
+
+    def annotations(self):
+        self.labels()
+
+    def addresses(self):
+        self.value = self.raw.split(',')
+
+    def capacity(self):
+        result = {}
+        for line in self.raw:
+            try:
+                key = re.sub(' ', '_', line.split(':')[0].lower())
+                value = ':'.join(line.split(':')[1].strip())
+                result[key] = value
+            except IndexError:
+                pass
+        self.value = result
+
+    def allocatable(self):
+        self.capacity()
+
+    def system_info(self):
+        self.capacity()
+
+    def non_terminated_pods(self):
+        result = []
+        for line in self.raw:
+            # Really needed?? XXX
+            line = re.sub('\t', ' ', line).strip()
+            try:
+                pod_info = re.match(r'^(?P<namespace>(\w-?)*) *' +
+                                    r'(?P<name>(\w[-.]?)*) *' +
+                                    r'(?P<cpu_requests>\w*) \(.*?\) *' +
+                                    r'(?P<cpu_limits>\w*) \(.*?\) *' +
+                                    r'(?P<memory_requests>\w*) \(.*?\) *' +
+                                    r'(?P<memory_limits>\w*) \(.*?\) *', line)
+                result.append(pod_info.groupdict())
+            except AttributeError:
+                pass
+        self.value = result
+
+    def allocated_resources(self):
+        line = re.sub('\t', ' ', self.raw[-1]).strip()
+        resources_info = re.match(r'(?P<cpu_requests>\w*) ' +
+                                  r'\((?P<cpu_requests_percent>.*?)\) *' +
+                                  r'(?P<cpu_limits>\w*) ' +
+                                  r'\((?P<cpu_limits_percent>.*?)\) *' +
+                                  r'(?P<memory_requests>\w*) ' +
+                                  r'\((?P<memory_requests_percent>.*?)\) *' +
+                                  r'(?P<memory_limits>\w*) ' +
+                                  r'\((?P<memory_limits_percent>.*?)\) *', line)
+        self.value = resources_info.groupdict()
+
+# def clean_k8s_yaml(resource, desired_keys, metadata_desired_keys):
+#    clean_deployment = {
+#        k: v for k, v in resource.items() if k in desired_keys}
+#    clean_deployment['metadata'] = {
+#        k: v for k, v in resource['metadata'].items()
+#        if k in metadata_desired_keys}
+#    return clean_deployment
+#
+#
+# def save_resource_yaml(kubectl_command, desired_keys,
+#                       metadata_desired_keys, resource_type):
+#    all_resources = json.loads(
+#        subprocess.check_output(kubectl_command, shell=True).decode().strip())
+#    for resource in all_resources['items']:
+#      resource = clean_k8s_yaml(resource, desired_keys, metadata_desired_keys)
+#        file_name = resource_type + '-' + \
+#            resource['metadata']['name'] + '.yaml'
+#        with open(file_name, 'w') as f:
+#            f.write(json.dumps(resource, indent=4, sort_keys=True))
+#
+#
+# def get_cluster_snapshot():
+#    desired_keys = ['apiVersion', 'kind', 'metadata', 'spec']
+#    metadata_desired_keys = ['labels', 'name', 'namespace']
+#    for resource_type in ['deployments', 'services', 'statefulsets', 'hpa']:
+#        kubectl_command = ' '.join(['kubectl get --all-namespaces',
+#                                    resource_type, '-o json'])
+#        save_resource_yaml(
+#           kubectl_command, desired_keys, metadata_desired_keys, resource_type)
+#
+
+
+class DeploymentFactory():
+    ''' Deployments object '''
+    def __init__(self):
+        self._get_info()
+
+    def _get_info(self):
+        pass
+
+    def print_limits(self):
+        print('\n-------------')
+        print(self.__name__())
+        print('-------------')
+        for deployment in self.data['items']:
+            print('* ' + deployment['metadata']['name'])
+            containers = deployment['spec']['template']['spec']['containers'][0]
+            limits = containers['resources']
+            for limit in limits.keys():
+                print('  * ' + limit)
+                for resource in limits[limit].keys():
+                    print('    * {}: {}'.format(
+                        resource, limits[limit][resource]))
+
+
+class Deployments(DeploymentFactory):
+    def __name__(self):
+        return 'Deployments'
+
+    def _get_info(self):
+        self.data = yaml.safe_load(subprocess.check_output(
+            "kubectl get deployments --all-namespaces -o yaml",
+            shell=True).decode())
+
+
+class Statefulsets(DeploymentFactory):
+    def __name__(self):
+        return 'Statefulsets'
+
+    def _get_info(self):
+        self.data = yaml.safe_load(subprocess.check_output(
+            "kubectl get statefulset --all-namespaces -o yaml",
+            shell=True).decode())
+
+
+class Daemonsets(DeploymentFactory):
+    def __name__(self):
+        return 'Daemonsets'
+
+    def _get_info(self):
+        self.data = yaml.safe_load(subprocess.check_output(
+            "kubectl get daemonset --all-namespaces -o yaml",
+            shell=True).decode())
+
+
+def main():
+    parser = load_parser()
+    args = parser.parse_args()
+
+    if args.kuster_command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    # if args.kuster_command in 'export-cluster':
+    #     get_cluster_snapshot()
+
+    if args.kuster_command == 'pod-number':
+        kluster = Kluster()
+        kluster.print_pod_number_in_cluster()
+
+    if args.kuster_command == 'pods':
+        kluster = Kluster()
+        kluster.print_pods_in_cluster()
+
+    if args.kuster_command == 'resources':
+        kluster = Kluster()
+        kluster.print_pod_number_in_cluster()
+        kluster.print_allocated_resources_in_cluster()
+
+    # elif args.kuster_command == 'hpa':
+    #     pass
+    elif args.kuster_command == 'limits':
+        Deployments().print_limits()
+        Statefulsets().print_limits()
+        Daemonsets().print_limits()
+
+if __name__ == "__main__":
+    main()
