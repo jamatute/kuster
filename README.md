@@ -10,10 +10,20 @@ Clone the repository
 git clone https://github.com/jamatute/kuster
 ```
 
+Install the dependencies
+```bash
+pip3 install -r requirements.txt
+```
+
 Give executable permissions and move it into your path
 ```bash
 chmod +x kuster/kuster
 mv kuster/kuster {{ somewhere_in_your_path }}
+```
+
+If you want the autocompletion add to your `~/.bashrc` or similar
+```bash
+eval "$(register-python-argcomplete kuster)"
 ```
 
 # Configuration
